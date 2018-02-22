@@ -22,9 +22,16 @@ extern double    TPinMoney       = 0;          //Net TP (money)
 extern double    tpPips          = 0;
 extern double    slPips          = 0;
 extern double    MaxGroupNum     = 1;
+extern int       openMa          = 10;    //开单均线周期一般为 10 20
 extern int       fastMa          = 50;
 extern int       slowMa          = 89;
 extern int       slowerMa        = 120;
+extern bool      isMoveSl        = false;  //是否移动止损
+extern int       profitLock_pips = 25;    //赚多少点，开始平保
+extern int       plPips          = 2;     //平保位于开单价格上多少点
+extern int       TrailStop_pips  = 20;    //每隔多少点开始移动止损
+extern int       TrailStep_pips  = 5;     //止损位每次移动多少点
+
 
 int       NumberOfTries   = 10,
           Slippage        = 5;
@@ -32,6 +39,7 @@ datetime  CheckTime;
 double    Pip;
 CTradeMgr *objCTradeMgr;  //订单管理类
 CDictionary *objDict = NULL;     //订单数据字典类
+CTpSlMgr *objCTpSlMgr = NULL;
 int tmp = 0;
 double  Lots = 0.01;
 //+------------------------------------------------------------------+
@@ -47,7 +55,7 @@ int OnInit()
    if(objDict == NULL){
       objDict = new CDictionary();
       objCTradeMgr = new CTradeMgr(MagicNumber, Pip, NumberOfTries, Slippage);
-      objCTpSlMgr = new CTpSlMgr(objCTradeMgr,objDict);
+      objCTpSlMgr = new CTpSlMgr(MagicNumber,Pip,objCTradeMgr,objDict);
    }
 //---
    return(INIT_SUCCEEDED);
@@ -75,42 +83,71 @@ void OnTick()
             每次新柱的开始：
             1、获取计算均线所需数据，计算常用均线位置值。
          */
-         Lots = LotsMgr::LotsMgr();  //动态lots
+         Lots = LotsMgr::lots();  //动态lots
+         CMaMgr::s_openMa = openMa;
          CMaMgr::Init(fastMa,slowMa,slowerMa);
          objCTpSlMgr.Init(tpPips, slPips);
-         objCTpSlMgr.DealTp();
+         objCTpSlMgr.SetMoveSl(isMoveSl, profitLock_pips, plPips, TrailStop_pips, TrailStep_pips);
+         objCTpSlMgr.MoveSl();
+         objCTpSlMgr.DealTp(smallTradeTypeCheck());
          dealCrossOpen();
      }
  }
 
 string  bigTradeType   = "none";      //3ema方向 buy sell none
 string  smallTradeType = "none";
+string  lastTradeType  = "none";
+string  lastTradeColCount = 0;
+bool    isCrossOpen = false;   //当前的交叉是否已经开过单
 //只处理开单
 void dealCrossOpen()
 {
-   
+   Print("--dealCrossOpen1--");
+   lastTradeColCount += 1;
    if(objDict.Total()>=MaxGroupNum)return ;
    bigTradeType = bigTradeTypeCheck();
    smallTradeType = smallTradeTypeCheck();
    int t = 0;
    double oop = 0;
+   Print("--dealCrossOpen2--",smallTradeType);
    if(smallTradeType == "crossUp"){
-      t = objCTradeMgr.Buy(Lots, 0, 0, smallTradeType);
-      if(t != 0){
-         if(OrderSelect(t, SELECT_BY_TICKET)==true){
-            oop = OrderOpenPrice();
-         }
-         objDict.AddObject(t, new CItems(t, type, TPinMoney, oop));
-      }
+      lastTradeType = "crossUp";
+      lastTradeColCount = 0;
+      isCrossOpen = false;
+      
    }else if(smallTradeType == "crossDown"){
-      t = objCTradeMgr.Sell(Lots, 0, 0, type);
-      if(t != 0){
-         if(OrderSelect(t, SELECT_BY_TICKET)==true){
-            oop = OrderOpenPrice();
+      lastTradeType = "crossDown";
+      lastTradeColCount = 0;
+      isCrossOpen = false;
+      
+   }
+   if(lastTradeType == "crossUp" && lastTradeColCount<=7){
+      //可以做开单位置控制，但是先不做
+      if(!isCrossOpen && Bid - CMaMgr::GetMa10(1) <= 12*Pip){
+         isCrossOpen = true;
+         t = objCTradeMgr.Buy(Lots, slPips, 0, "crossUp");
+         if(t != 0){
+            if(OrderSelect(t, SELECT_BY_TICKET)==true){
+               oop = OrderOpenPrice();
+            }
+            objDict.AddObject(t, new CItems(t, "crossUp", TPinMoney, oop));
          }
-         objDict.AddObject(t, new CItems(t, type, TPinMoney, oop));
       }
    }
+   if(lastTradeType == "crossDown" && lastTradeColCount<=7){
+      //可以做开单位置控制，但是先不做
+      if(!isCrossOpen && CMaMgr::GetMa10(1)-Ask <= 12*Pip){
+         isCrossOpen = true;
+         t = objCTradeMgr.Sell(Lots, slPips, 0, "crossDown");
+         if(t != 0){
+            if(OrderSelect(t, SELECT_BY_TICKET)==true){
+               oop = OrderOpenPrice();
+            }
+            objDict.AddObject(t, new CItems(t, "crossDown", TPinMoney, oop));
+         }
+      }
+   }
+   
 }
 
 string bigTradeTypeCheck(){
@@ -130,8 +167,26 @@ string bigTradeTypeCheck(){
 string smallTradeTypeCheck(){
    double ma10_pre  = CMaMgr::GetMa10(3),
           ma10_next = CMaMgr::GetMa10(2),
+          ma10_now  = CMaMgr::GetMa10(1),
           ma10Overying_pre  = CMaMgr::GetMa10Overlying(3),
-          ma10Overying_next = CMaMgr::GetMa10Overlying(2);
+          ma10Overying_next = CMaMgr::GetMa10Overlying(2),
+          ma10Overying_now = CMaMgr::GetMa10Overlying(1);
+   Print("ma10_pre:",ma10_pre,";ma10_next:",ma10_next,";ma10Overying_pre:",ma10Overying_pre,";ma10Overying_next:",ma10Overying_next);
+   if(ma10_pre < ma10Overying_pre && ma10_next > ma10Overying_next && ma10_now>ma10Overying_now){
+      return "crossUp";
+   }
+   if(ma10_pre > ma10Overying_pre && ma10_next < ma10Overying_next && ma10_now<ma10Overying_now){
+      return "crossDown";
+   }
+   return "none";
+}
+
+/*
+ string tpCrossCheck(){
+   double ma10_pre  = CMaMgr::GetMa10(2),
+          ma10_next = CMaMgr::GetMa10(1),
+          ma10Overying_pre  = CMaMgr::GetMa10Overlying(2),
+          ma10Overying_next = CMaMgr::GetMa10Overlying(1);
    if(ma10_pre < ma10Overying_pre && ma10_next > ma10Overying_next){
       return "crossUp";
    }
@@ -140,9 +195,7 @@ string smallTradeTypeCheck(){
    }
    return "none";
 }
-
-
-
+*/
 
 void subPrintDetails()
 {
